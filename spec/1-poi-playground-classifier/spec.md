@@ -112,12 +112,12 @@ Playwright runs headless with a realistic desktop user-agent and viewport, using
 ### Functional Requirements
 
 #### FR-4.1: Pluggable classifier interface
-`photo_classifier` exposes an abstract interface — `PlaygroundClassifier.classify(photo: Photo) -> ClassificationResult`, where `ClassificationResult` has `is_playground: bool` and a **required** `confidence: float` in `[0, 1]` — with exactly one v1 implementation (`ClaudeVisionClassifier`). A classification that fails outright (FR-4.4) does not produce a `ClassificationResult` at all; failure is represented by the photo being skipped, never by a null or missing confidence on a result object. `decision_engine` and `cli` must interact with classifiers only through this interface (no concrete-class checks), so a future local/specialized model can be substituted without touching either.
-**Verify:** A unit test provides a fake classifier implementing the interface and confirms `decision_engine` drives it correctly with no `isinstance` checks against `ClaudeVisionClassifier`.
+`photo_classifier` exposes an abstract interface — `PlaygroundClassifier.classify(photo: Photo) -> ClassificationResult`, where `ClassificationResult` has `is_playground: bool` and a **required** `confidence: float` in `[0, 1]` — with exactly one v1 implementation (`LiteLLMVisionClassifier`). A classification that fails outright (FR-4.4) does not produce a `ClassificationResult` at all; failure is represented by the photo being skipped, never by a null or missing confidence on a result object. `decision_engine` and `cli` must interact with classifiers only through this interface (no concrete-class checks), so a future local/specialized model can be substituted without touching either.
+**Verify:** A unit test provides a fake classifier implementing the interface and confirms `decision_engine` drives it correctly with no `isinstance` checks against `LiteLLMVisionClassifier`.
 
-#### FR-4.2: Classify photos via Claude vision
-`ClaudeVisionClassifier` sends each photo as a base64-encoded image content block (JPEG, PNG, GIF, or WebP) in a Messages API call to the model given by the required `--vision-model` flag (see FR-7.1 — this flag has no default; the CLI fails argument parsing if it's omitted). Before encoding, a photo is resized if needed so its base64-encoded payload stays under **10MB** and its pixel dimensions stay within **8000×8000** — the current direct-API limits — rather than the previously-assumed 20MB. The classifier obtains a structured response via Anthropic's forced tool-choice (tool use) mechanism (see AR-4.2), asking whether the image shows kid-playground equipment (slides, swings, jungle gyms, climbing structures, etc.).
-**Verify:** A unit test with a mocked Anthropic tool-use response asserts both a positive and a negative structured response parse correctly into `ClassificationResult`; a unit test with an oversized fake image asserts it is resized before encoding.
+#### FR-4.2: Classify photos via a litellm-routed vision model
+`LiteLLMVisionClassifier` sends each photo as a base64-encoded image (JPEG, PNG, GIF, or WebP, as a `data:` URI in an `image_url` content block — litellm's provider-agnostic message format) in a `litellm.completion()` call to the model string given by `--vision-model` (see FR-7.1 — required unless `PLAYGROUND_CHECK_VISION_MODEL` is set). Routing through litellm rather than a single provider's SDK directly means any litellm-supported vision-capable model can be used (e.g. `anthropic/claude-haiku-4-5`, `gpt-4o`, `gemini/gemini-2.0-flash`) by changing only this one string — no code change needed to switch providers. Before encoding, a photo is resized if needed so its base64-encoded payload stays under **10MB** and its pixel dimensions stay within **8000×8000** — conservative limits chosen to comfortably satisfy the current direct-API limits of the major vision providers litellm routes to, rather than maintaining a per-provider limit table. The classifier obtains a structured response via litellm's OpenAI-style forced tool-choice mechanism (see AR-4.2), asking whether the image shows kid-playground equipment (slides, swings, jungle gyms, climbing structures, etc.).
+**Verify:** A unit test with a mocked `litellm.completion` tool-call response asserts both a positive and a negative structured response parse correctly into `ClassificationResult`; a unit test with an oversized fake image asserts it is resized before encoding.
 
 #### FR-4.3: Threshold-based early stop and confidence aggregation
 `decision_engine` classifies fetched photos one at a time, in retrieval order, and stops as soon as the count of `is_playground=True` results reaches `--threshold` (default **1**) — it does not classify remaining photos once the threshold is met. When the threshold is met, the final `confidence` is the **minimum** confidence value among the qualifying (`is_playground=True`) photos (the weakest link among the positive evidence used). If the photo cap is exhausted without meeting the threshold, the label is `"no playground nearby"` and `confidence` is `null`.
@@ -128,16 +128,16 @@ If a classification call fails (network error, rate limit, malformed response) f
 **Verify:** A unit test mocks one failing call among three photos and asserts classification continues past it; a test where all calls fail asserts `CLASSIFIER_ERROR` is returned.
 
 #### FR-4.5: Fail fast on missing credentials
-Immediately after `osm_lookup` returns an inconclusive result — before invoking `gmaps_scraper` (Feature 3) — `cli.py` verifies that `ANTHROPIC_API_KEY` is set. If it is absent, return `error: CONFIG_ERROR` without invoking `gmaps_scraper` or performing any further Playwright work. (Resolution, per FR-1.2, may already have used the shared browser context before this check runs — this check only guarantees no *additional* Playwright work happens for scraping.)
-**Verify:** A unit test with the environment variable unset asserts `gmaps_scraper` is never invoked and `CONFIG_ERROR` is returned.
+Immediately after `osm_lookup` returns an inconclusive result — before invoking `gmaps_scraper` (Feature 3) — `cli.py` calls `litellm.validate_environment(vision_model)` to check whether the credential(s) required for the configured `--vision-model` are present (e.g. `ANTHROPIC_API_KEY` for an `anthropic/*` model, `OPENAI_API_KEY` for a `gpt-*` model — whatever litellm reports as missing for that specific model string). If it reports any missing key(s), return `error: CONFIG_ERROR` (message includes the reported missing key names) without invoking `gmaps_scraper` or performing any further Playwright work. (Resolution, per FR-1.2, may already have used the shared browser context before this check runs — this check only guarantees no *additional* Playwright work happens for scraping.) litellm's `validate_environment` is documented as unreliable for a handful of specific models (e.g. some Gemini/Cohere models may always report a false negative); if this affects the configured `--vision-model`, the missing-credential failure surfaces later as `CLASSIFIER_ERROR` from the first classification attempt instead of `CONFIG_ERROR` here — still a correct outcome, just a less immediately informative one, and an accepted limitation rather than something this spec works around.
+**Verify:** A unit test with a mocked `litellm.validate_environment` reporting a missing key asserts `gmaps_scraper` is never invoked and `CONFIG_ERROR` is returned with that key name in the message.
 
 ### Architectural Requirements
 
 #### AR-4.1: Credential handling
-The Anthropic API key is read from the `ANTHROPIC_API_KEY` environment variable (standard SDK behavior) and is never accepted as a CLI argument, logged, or included in any output, sidecar, or debug log — only its presence/absence (FR-4.5) is ever observable.
+The credential required for the configured `--vision-model` (whichever environment variable litellm expects for that model's provider) is read from the environment by litellm itself, the same way each provider's own SDK would — `cli.py` and `photo_classifier` never read, construct, or pass a credential value directly, never accept one as a CLI argument, and never log or include one in any output, sidecar, or debug log. Only a credential's presence/absence (FR-4.5, via `litellm.validate_environment`) is ever observable. A `.env` file (loaded once at CLI startup via `python-dotenv`, see AR-7.3) is one way to populate these environment variables without exporting them in the shell; it does not change which variables are read or how they're used once present.
 
-#### AR-4.2: Structured output via tool use
-`ClaudeVisionClassifier` uses Anthropic's forced tool-choice (tool use) mechanism with an explicit JSON schema (`is_playground: boolean`, `confidence: number` in `[0, 1]`, both required) to obtain the classification result, rather than parsing free-text prose — making the response deterministically parseable and testable regardless of prompt wording changes. Where supported, the tool definition sets `strict: true` for guaranteed schema conformance; FR-4.4's malformed-response handling remains as defense in depth for responses that still don't conform.
+#### AR-4.2: Structured output via forced tool choice
+`LiteLLMVisionClassifier` uses litellm's OpenAI-style forced tool-choice mechanism (`tool_choice={"type": "function", "function": {"name": "classify_playground"}}`, alongside a matching `tools=[...]` definition) with an explicit JSON schema (`is_playground: boolean`, `confidence: number` in `[0, 1]`, both required) to obtain the classification result, rather than parsing free-text prose — making the response deterministically parseable and testable regardless of prompt wording, and portable across whichever provider `--vision-model` resolves to, since litellm translates this one convention into each provider's native tool-calling format. Where the resolved provider path supports it, the tool definition sets `strict: true` for stronger schema conformance; FR-4.4's malformed-response handling remains as defense in depth for responses that still don't conform, or for providers where `strict` isn't honored.
 
 ---
 
@@ -185,12 +185,12 @@ If writing an evidence photo or its metadata sidecar fails (e.g. disk full, perm
 ### Functional Requirements
 
 #### FR-7.1: Command-line interface
-A single console-script entrypoint (e.g. `playground-check`), built with `argparse`, accepts a positional `input` argument and flags: `--osm-radius` (default 150), `--osm-timeout` (default 10), `--osm-endpoint` (default `https://overpass-api.de/api/interpreter`), `--max-photos` (default 20), `--threshold` (default 1), `--vision-model` (**required, no default**), `--page-timeout` (default 20), `--output-dir`, `--output-file`. `--help` lists all flags, showing defaults for every flag that has one and marking `--vision-model` as required.
-**Verify:** A subprocess-based test runs `playground-check --help`, asserts exit code 0, and asserts every documented flag appears in the output; a test invoking the CLI without `--vision-model` asserts argparse rejects it (exit code 2) before any pipeline stage runs.
+A single console-script entrypoint (e.g. `playground-check`), built with `argparse`, accepts a positional `input` argument and flags: `--osm-radius` (default 150), `--osm-timeout` (default 10), `--osm-endpoint` (default `https://overpass-api.de/api/interpreter`), `--max-photos` (default 20), `--threshold` (default 1), `--vision-model` (**required unless `PLAYGROUND_CHECK_VISION_MODEL` is set in the environment**, in which case that value is used and an explicit `--vision-model` flag always overrides it), `--page-timeout` (default 20), `--output-dir`, `--output-file`. `--help` lists all flags, showing defaults for every flag that has one and noting `--vision-model`'s environment-variable fallback.
+**Verify:** A subprocess-based test runs `playground-check --help`, asserts exit code 0, and asserts every documented flag appears in the output; a test invoking the CLI without `--vision-model` and with `PLAYGROUND_CHECK_VISION_MODEL` unset asserts argparse rejects it (exit code 2) before any pipeline stage runs; a test with `PLAYGROUND_CHECK_VISION_MODEL` set and `--vision-model` omitted asserts the env var's value is used; a test with both set asserts the explicit flag wins.
 
 #### FR-7.2: End-to-end orchestration
 `cli.py` wires `input_resolver` → `osm_lookup` → (conditionally, per FR-4.5) `gmaps_scraper` + `photo_classifier` → `decision_engine` → `storage` + stdout output, propagating any `error` from an earlier stage straight to the final output without invoking later stages.
-**Verify:** An end-to-end test with all external calls (Overpass, Playwright, Anthropic) mocked runs the full CLI for one OSM-positive case and one GMaps-fallback case, asserting the correct output for each.
+**Verify:** An end-to-end test with all external calls (Overpass, Playwright, litellm) mocked runs the full CLI for one OSM-positive case and one GMaps-fallback case, asserting the correct output for each.
 
 ### Architectural Requirements
 
@@ -199,6 +199,9 @@ CLI numeric flags are validated at startup, before any pipeline stage runs: `osm
 
 #### AR-7.2: Exit codes and stream discipline
 Once the pipeline runs, exactly one JSON document (Feature 5) is written to stdout; all logs/diagnostics go to stderr. Exit code is **0** whenever the CLI produces a well-formed JSON result — whether that result is a successful `label` or a defined `error` code — since both are contractually valid, parseable outcomes. Exit code is **1** only for a truly unhandled internal failure, in which case the CLI still attempts to print the normal FR-5.1 envelope — `input` preserved (it's always known, even on internal failure), `evidence: []`, `resolved`/`label`/`method_used`/`confidence` all `null`, and `error: {"code": "INTERNAL_ERROR", "message": "..."}` — rather than a schema-breaking shortcut. Exit code **2** is reserved for CLI usage/validation errors raised by argparse or by AR-7.1's invariant checks — these happen *before* the pipeline runs, so no JSON is emitted for them; this is the one exception to "exactly one JSON document," since there is no pipeline run to report on.
+
+#### AR-7.3: `.env` file loading
+`cli.py` calls `python-dotenv`'s `load_dotenv()` once, as the first action in `main()` — before the argument parser is built (so `PLAYGROUND_CHECK_VISION_MODEL`, if only set via `.env`, is available for FR-7.1's default) and before any credential is read (so any provider key, if only set via `.env`, is available for FR-4.5/AR-4.1). A shell-exported environment variable always takes precedence over the same variable's value in `.env` (`load_dotenv()`'s default behavior — it does not overwrite an already-set variable). `.env` is never committed (gitignored); an `.env.example` documents the variables the tool reads.
 
 ---
 
@@ -226,7 +229,7 @@ A `tests/` suite, runnable via `pytest`, covers every FR's **Verify** condition 
 ## Integration Points
 
 - **OpenStreetMap Overpass API** (default `overpass-api.de`, overridable via `--osm-endpoint`) — public, unauthenticated, rate-limited by fair use; send a descriptive `User-Agent` header. Verified query syntax (including the `nwr` combinator and `out count;`) per the [Overpass API/Overpass QL wiki](https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL).
-- **Anthropic Messages API** — requires `ANTHROPIC_API_KEY`; image content blocks per [Vision - Claude Platform Docs](https://platform.claude.com/docs/en/build-with-claude/vision): JPEG/PNG/GIF/WebP, **10MB max base64-encoded payload** on the direct API, **8000×8000px** max dimensions (re-verified directly against current docs during spec update — the original 20MB figure in v1 of this spec was incorrect).
+- **litellm** (`litellm.completion()`) — routes the vision-classification call to whichever provider `--vision-model` names, requiring that provider's own credential env var (e.g. `ANTHROPIC_API_KEY` for `anthropic/*`, `OPENAI_API_KEY` for `gpt-*`); image content uses litellm's provider-agnostic `image_url`/`data:` URI format, and forced tool-choice uses its OpenAI-style `{"type": "function", "function": {...}}` convention (verified against current litellm docs). Image limits: **10MB max base64-encoded payload**, **8000×8000px** max dimensions — conservative limits chosen to satisfy the major providers litellm routes to (originally verified directly against Anthropic's own docs when the tool called Anthropic directly; the original 20MB figure in v1 of this spec was incorrect).
 - **Google Maps web UI via Playwright/Chromium** — unofficial, no auth, no ToS-sanctioned access; see AR-3.1 and the Constraints section below.
 
 ## Related Specs
@@ -235,7 +238,7 @@ None — this is the first spec in this repository.
 
 ## Constraints
 - Python **3.12** minimum.
-- **Poetry** for dependency management and packaging. Direct dependencies: an HTTP client (e.g. `httpx`), Playwright (plus its browser binary, provisioned via a `playwright install chromium` step documented in the project's setup instructions — a `poetry install` alone does not provision the browser), the Anthropic Python SDK, and an image-processing library (e.g. Pillow) for resize/validation ahead of the 10MB/8000×8000 limits in FR-4.2.
+- **Poetry** for dependency management and packaging. Direct dependencies: an HTTP client (e.g. `httpx`), Playwright (plus its browser binary, provisioned via a `playwright install chromium` step documented in the project's setup instructions — a `poetry install` alone does not provision the browser), `litellm` (multi-provider LLM routing — the vision classifier is not coupled to a single provider's SDK), `python-dotenv` (`.env` file loading, AR-7.3), and an image-processing library (e.g. Pillow) for resize/validation ahead of the 10MB/8000×8000 limits in FR-4.2.
 - **argparse** (stdlib) for the CLI — no additional CLI framework dependency.
 - No Google Maps API account. Google Maps access is via Playwright browser automation only. This is against Google's Terms of Service; accepted as a deliberate, low-volume, personal/experimental-use risk. Revisit before any scaling, public deployment, or productization.
 - Low expected call volume — no dedicated rate-limiter/queueing system is required; per-step timeouts (Feature 2, 3) are sufficient.
@@ -254,17 +257,18 @@ None — this is the first spec in this repository.
 - **Google Maps' DOM is unofficial and will drift.** AR-3.1 isolates selectors for maintainability, but scraper breakage after a Google UI change is expected over time, not a one-time risk.
 - **The public Overpass instance offers no uptime guarantee.** FR-2.3's fallback and the `--osm-endpoint` override (FR-7.1) mitigate but don't eliminate this.
 - **Evidence photos are third-party user-contributed content** (uploaded to Google Maps by other users) and may depict identifiable people. No additional rights/licensing review is performed before persisting them locally in v1 — consistent with the already-accepted personal/experimental-use posture (see Constraints). Revisit before any sharing, publication, or use as training data beyond personal experimentation.
+- **litellm's cross-provider normalization isn't perfectly uniform.** `strict: true` schema conformance (AR-4.2) and `validate_environment` (FR-4.5) are both documented as not working identically for every provider/model litellm supports. This is an accepted trade-off of gaining multi-provider portability: the worst case for either gap is a `ClassifierError`/`CONFIG_ERROR` surfacing slightly differently than expected for an unusual model choice, not a silent wrong answer — FR-4.4's malformed-response handling remains the actual safety net regardless of which provider's quirks are in play.
 
 ## Spec Completeness Checklist
 
 - [x] **Scope & acceptance criteria** — single-POI scope stated in Overview/Goals; every FR has a Verify line; Out of Scope enumerates explicit non-goals.
 - [x] **Testing strategy** — Feature 8 (FR-8.1) requires a `pytest` suite covering every FR's Verify condition with externals mocked, plus opt-in integration tests.
 - [N/A] **Existing patterns** — repository is empty (no prior code); confirmed via direct inspection, nothing to compare against.
-- [x] **Dependencies** — Constraints now lists each direct dependency (HTTP client, Playwright + browser binary provisioning, Anthropic SDK, image library) with its justifying requirement.
-- [x] **Architecture & interfaces** — module boundaries and ownership are defined in each Feature's AR (AR-1.1 now also covers browser-session ownership; AR-2.1; AR-3.1/3.2; AR-4.1/4.2; AR-7.1/7.2), and Data Requirements defines all shared value types including the newly-added `Photo` type.
+- [x] **Dependencies** — Constraints now lists each direct dependency (HTTP client, Playwright + browser binary provisioning, litellm, python-dotenv, image library) with its justifying requirement.
+- [x] **Architecture & interfaces** — module boundaries and ownership are defined in each Feature's AR (AR-1.1 now also covers browser-session ownership; AR-2.1; AR-3.1/3.2; AR-4.1/4.2; AR-7.1/7.2/7.3), and Data Requirements defines all shared value types including the `Photo` type.
 - [x] **Error handling & failure modes** — full error taxonomy (`INVALID_INPUT`, `POI_NOT_FOUND`, `NO_PHOTOS_AVAILABLE`, `SCRAPE_BLOCKED`, `TIMEOUT`, `CLASSIFIER_ERROR`, `CONFIG_ERROR`, `INTERNAL_ERROR`) is assigned to the FR of the stage that raises it, with a discriminated success/error output schema (FR-5.1) and exit-code contract (AR-7.2).
-- [x] **Security review** — AR-4.1 mandates the Anthropic key come only from an environment variable and never be logged; Assumptions & Risks discloses the photo-provenance/PII posture explicitly rather than claiming no PII is involved.
-- [x] **Performance impact** — OSM fast-path (Feature 2), the photo-count cap plus early-stop threshold with dedup (FR-3.2, FR-4.3), and explicit client+server timeouts (FR-2.3, FR-3.1) bound latency, bandwidth, and Claude API cost per run.
+- [x] **Security review** — AR-4.1 mandates that whichever provider credential `--vision-model` needs comes only from an environment variable (never logged, never passed as a CLI argument), regardless of which litellm-supported provider is configured; Assumptions & Risks discloses the photo-provenance/PII posture explicitly rather than claiming no PII is involved.
+- [x] **Performance impact** — OSM fast-path (Feature 2), the photo-count cap plus early-stop threshold with dedup (FR-3.2, FR-4.3), and explicit client+server timeouts (FR-2.3, FR-3.1) bound latency, bandwidth, and vision-model API cost per run.
 - [N/A] **Rollout & migration** — greenfield CLI tool with no existing users/data to migrate.
 - [x] **Assumptions & risks** — dedicated Assumptions & Risks section states the heuristic nature of the label, scraper fragility, Overpass reliability, and evidence-photo provenance explicitly.
 
@@ -344,3 +348,19 @@ None — this is the first spec in this repository.
 
 **Reorganized:**
 - None — all changes applied in place within Feature 1.
+
+### Update from user request (post-close): multi-provider classifier + `.env` config
+
+**Applied:**
+- Migrated `photo_classifier` from calling the Anthropic SDK directly to routing through **litellm** (`litellm.completion()`), so `--vision-model` can name any litellm-supported vision-capable model (`anthropic/claude-haiku-4-5`, `gpt-4o`, `gemini/gemini-2.0-flash`, etc.) without a code change. Renamed the v1 classifier implementation from `ClaudeVisionClassifier` to `LiteLLMVisionClassifier` to match (FR-4.1, FR-4.2).
+- Switched the image content format from Anthropic's native `source` block to litellm's provider-agnostic `image_url`/`data:` URI convention, and the forced tool-choice mechanism from Anthropic's `{"type": "tool", "name": ...}` to litellm's OpenAI-style `{"type": "function", "function": {"name": ...}}` (AR-4.2) — verified against current litellm docs.
+- Generalized credential handling (AR-4.1) and the fail-fast check (FR-4.5) from a hardcoded `ANTHROPIC_API_KEY` read to `litellm.validate_environment(vision_model)`, which reports whichever credential the configured model's provider actually needs — documented `validate_environment`'s known unreliability for a handful of models as an accepted limitation (Assumptions & Risks) rather than a blocking gap.
+- Added `--vision-model`'s environment-variable fallback: `PLAYGROUND_CHECK_VISION_MODEL`, checked when the flag is omitted, with the explicit flag always taking precedence (FR-7.1).
+- Added `.env` file support via `python-dotenv`, loaded once at CLI startup before the argument parser is built (new AR-7.3) — gitignored, with `.env.example` documenting the variables the tool reads.
+- Added `litellm` and `python-dotenv` as dependencies; removed the direct `anthropic` SDK dependency (Constraints, Integration Points).
+
+**Rejected:**
+- None — this was a scoped, requested change; the user explicitly chose to adopt litellm now rather than defer it.
+
+**Reorganized:**
+- None — all changes applied in place within Features 4 and 7.
