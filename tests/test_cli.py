@@ -203,6 +203,44 @@ def test_config_invariants_reject_bad_threshold(monkeypatch: pytest.MonkeyPatch)
     fake_resolve.assert_not_called()
 
 
+def test_context_factory_creates_exactly_one_context_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AR-1.1: exactly one Playwright browser/context is created per
+    invocation, no matter how many times get_context() is called, and it's
+    torn down by close() even though it was created lazily."""
+    fake_context = MagicMock(name="context")
+    fake_browser = MagicMock(name="browser")
+    fake_browser.new_context.return_value = fake_context
+    fake_playwright = MagicMock(name="playwright")
+    fake_playwright.chromium.launch.return_value = fake_browser
+    fake_start = MagicMock(return_value=fake_playwright)
+    monkeypatch.setattr(cli, "sync_playwright", MagicMock(return_value=MagicMock(start=fake_start)))
+
+    get_context, close = cli._make_context_factory(page_timeout_seconds=20)
+
+    # Never calling get_context() at all must never launch anything.
+    close()
+    fake_start.assert_not_called()
+
+    get_context, close = cli._make_context_factory(page_timeout_seconds=20)
+    first = get_context()
+    second = get_context()
+    third = get_context()
+
+    assert first is second is third is fake_context
+    fake_start.assert_called_once()
+    fake_playwright.chromium.launch.assert_called_once()
+    fake_browser.new_context.assert_called_once()
+    fake_context.set_default_timeout.assert_called_once_with(20 * 1000)
+    fake_context.set_default_navigation_timeout.assert_called_once_with(20 * 1000)
+
+    close()
+    fake_context.close.assert_called_once()
+    fake_browser.close.assert_called_once()
+    fake_playwright.stop.assert_called_once()
+
+
 def test_output_file_matches_stdout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
 ) -> None:
