@@ -1,6 +1,6 @@
 """CLI entrypoint wiring every module together (spec Feature 7: FR-7.1,
-FR-7.2, AR-7.1, AR-7.2; plus FR-4.5, FR-5.1, FR-5.2, and AR-1.1's `cli.py`-
-ownership half of the shared browser context).
+FR-7.2, AR-7.1, AR-7.2, AR-7.3; plus FR-4.5, FR-5.1, FR-5.2, and AR-1.1's
+`cli.py`-ownership half of the shared browser context).
 """
 
 from __future__ import annotations
@@ -13,16 +13,22 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import litellm
+from dotenv import load_dotenv
 from playwright.sync_api import BrowserContext
 from playwright.sync_api import sync_playwright
 
 from playground_check import decision_engine, gmaps_scraper, input_resolver, osm_lookup, storage
 from playground_check.errors import ConfigError, PlaygroundCheckError
 from playground_check.models import ResolvedPOI
-from playground_check.photo_classifier import ClaudeVisionClassifier
+from playground_check.photo_classifier import LiteLLMVisionClassifier
 
 #: Default Overpass endpoint (spec FR-2.1).
 _DEFAULT_OSM_ENDPOINT = "https://overpass-api.de/api/interpreter"
+
+#: Env var fallback for --vision-model (spec FR-7.1) -- checked when the flag
+#: is omitted; an explicit --vision-model always overrides it.
+_VISION_MODEL_ENV_VAR = "PLAYGROUND_CHECK_VISION_MODEL"
 
 #: A realistic desktop user-agent/viewport for the shared browser context
 #: (spec AR-3.2) -- not a real browser's exact string, just plausible.
@@ -82,8 +88,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vision-model",
         type=str,
-        required=True,
-        help="Claude vision model to use for photo classification (required, no default).",
+        required=False,
+        default=os.environ.get(_VISION_MODEL_ENV_VAR),
+        help=(
+            "litellm-recognized vision model to use for photo classification "
+            "(e.g. anthropic/claude-haiku-4-5, gpt-4o). Required unless the "
+            f"{_VISION_MODEL_ENV_VAR} environment variable is set; an "
+            "explicit flag always overrides the environment variable."
+        ),
     )
     parser.add_argument(
         "--page-timeout",
@@ -109,6 +121,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     """AR-7.1's configuration invariants -- violations produce a standard
     argparse error (exit code 2) before any pipeline stage runs."""
+    if not args.vision_model:
+        parser.error(
+            f"--vision-model is required (or set {_VISION_MODEL_ENV_VAR})"
+        )
     if args.osm_radius <= 0:
         parser.error("--osm-radius must be > 0")
     if args.osm_timeout <= 0:
@@ -181,15 +197,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         if osm_hit:
             decision = decision_engine.decide_from_osm_hit()
         else:
-            # FR-4.5: fail fast on a missing API key, before invoking
-            # gmaps_scraper or doing any further Playwright work -- but
-            # resolution (above) may already have used the browser.
-            if not os.environ.get("ANTHROPIC_API_KEY"):
+            # FR-4.5: fail fast on a missing provider credential, before
+            # invoking gmaps_scraper or doing any further Playwright work --
+            # but resolution (above) may already have used the browser.
+            env_check = litellm.validate_environment(args.vision_model)
+            if not env_check.get("keys_in_environment", False):
+                missing = ", ".join(env_check.get("missing_keys", [])) or "required credential"
                 raise ConfigError(
-                    "ANTHROPIC_API_KEY is not set; cannot classify photos."
+                    f"Missing credential(s) for --vision-model {args.vision_model!r}: {missing}."
                 )
             photos = gmaps_scraper.fetch_photos(poi, get_context, max_photos=args.max_photos)
-            classifier = ClaudeVisionClassifier(args.vision_model)
+            classifier = LiteLLMVisionClassifier(args.vision_model)
             decision = decision_engine.decide_from_photos(
                 photos, classifier, threshold=args.threshold
             )
@@ -230,6 +248,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # AR-7.3: load .env before anything else -- both the vision-model
+    # env-var fallback (FR-7.1) and any provider credential (AR-4.1) may
+    # only be set there. A shell-exported value always wins over .env's
+    # (load_dotenv's default behavior).
+    load_dotenv()
+
     parser = _build_parser()
     args = parser.parse_args(argv)
     _validate_args(args, parser)

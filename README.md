@@ -3,7 +3,9 @@
 Classify a Google Maps Point of Interest (POI) as having a nearby kid's
 playground or not. Checks OpenStreetMap first (free, fast); if that's
 inconclusive, falls back to opening the POI in Google Maps via a headless
-browser, pulling photos, and classifying them with Claude vision.
+browser, pulling photos, and classifying them with a vision model (any
+[litellm](https://docs.litellm.ai/docs/providers)-supported provider —
+Anthropic, OpenAI, Gemini, etc.).
 
 See [`spec/1-poi-playground-classifier/spec.md`](spec/1-poi-playground-classifier/spec.md) for the full specification.
 
@@ -12,19 +14,24 @@ See [`spec/1-poi-playground-classifier/spec.md`](spec/1-poi-playground-classifie
 ```bash
 poetry install
 poetry run playwright install chromium
-export ANTHROPIC_API_KEY=sk-ant-...
+cp .env.example .env   # then fill in your provider's API key
 ```
 
-`ANTHROPIC_API_KEY` is only required when a POI's OSM check is inconclusive
-and the tool falls back to classifying Google Maps photos — an OSM hit never
-needs it.
+Edit `.env` (gitignored, never committed) with the credential your chosen
+`--vision-model` needs — e.g. `ANTHROPIC_API_KEY` for `anthropic/*` models,
+`OPENAI_API_KEY` for `gpt-*` models — and, optionally,
+`PLAYGROUND_CHECK_VISION_MODEL` so you don't have to pass `--vision-model`
+on every invocation. `.env` is loaded automatically; a real shell-exported
+variable always takes precedence over `.env`'s value. No credential is
+needed at all when a POI's OSM check already confirms a hit — only the
+Google Maps photo fallback path calls the vision model.
 
 ## Usage
 
 ```bash
-poetry run playground-check "40.7308,-73.9973" --vision-model claude-haiku-4-5
-poetry run playground-check "https://maps.app.goo.gl/exampleShortLink" --vision-model claude-haiku-4-5
-poetry run playground-check "Golden Gate Park, San Francisco" --vision-model claude-haiku-4-5
+poetry run playground-check "40.7308,-73.9973" --vision-model anthropic/claude-haiku-4-5
+poetry run playground-check "https://maps.app.goo.gl/exampleShortLink" --vision-model gpt-4o
+poetry run playground-check "Golden Gate Park, San Francisco"   # uses PLAYGROUND_CHECK_VISION_MODEL from .env
 ```
 
 Prints one JSON document to stdout, e.g.:

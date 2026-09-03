@@ -1,28 +1,27 @@
 """Unit tests for `playground_check.photo_classifier` (spec FR-4.1, FR-4.2,
-FR-4.4, AR-4.1, AR-4.2 Verify conditions). The `anthropic` client is mocked
-entirely -- no real API calls, no `ANTHROPIC_API_KEY` needed, per FR-8.1."""
+FR-4.4, AR-4.1, AR-4.2 Verify conditions). `litellm.completion` is mocked
+entirely -- no real API calls, no provider credential needed, per FR-8.1."""
 
 from __future__ import annotations
 
 import base64
 import inspect
 import io
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import anthropic
+import litellm
 import pytest
 from PIL import Image
 
 from playground_check import photo_classifier
+from playground_check.decision_engine import PlaygroundClassifier
 from playground_check.errors import ClassifierError
 from playground_check.models import ClassificationResult, Photo
-from playground_check.photo_classifier import (
-    ClaudeVisionClassifier,
-    PlaygroundClassifier,
-)
+from playground_check.photo_classifier import LiteLLMVisionClassifier
 
-MODEL = "claude-opus-5"
+MODEL = "anthropic/claude-haiku-4-5"
 
 
 def _make_small_photo(mime_type: str = "image/jpeg") -> Photo:
@@ -50,18 +49,20 @@ def _make_oversized_photo() -> Photo:
     )
 
 
-def _tool_use_response(is_playground: object, confidence: object) -> SimpleNamespace:
-    tool_use_block = SimpleNamespace(
-        type="tool_use",
+def _tool_call_response(is_playground: object, confidence: object) -> SimpleNamespace:
+    """A litellm/OpenAI-shaped completion response with one tool call."""
+    function = SimpleNamespace(
         name="classify_playground",
-        id="toolu_01",
-        input={"is_playground": is_playground, "confidence": confidence},
+        arguments=json.dumps({"is_playground": is_playground, "confidence": confidence}),
     )
-    return SimpleNamespace(content=[tool_use_block])
+    tool_call = SimpleNamespace(function=function)
+    message = SimpleNamespace(tool_calls=[tool_call])
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
-def _patch_client(monkeypatch: pytest.MonkeyPatch, fake_client: MagicMock) -> None:
-    monkeypatch.setattr(anthropic, "Anthropic", lambda: fake_client)
+def _no_tool_call_response() -> SimpleNamespace:
+    message = SimpleNamespace(tool_calls=None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +74,10 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, fake_client: MagicMock) -> No
 def test_positive_tool_use_response_parses_into_classification_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response(True, 0.9)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response(True, 0.9))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     result = classifier.classify(_make_small_photo())
 
     assert result == ClassificationResult(is_playground=True, confidence=0.9)
@@ -86,11 +86,10 @@ def test_positive_tool_use_response_parses_into_classification_result(
 def test_negative_tool_use_response_parses_into_classification_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response(False, 0.1)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response(False, 0.1))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     result = classifier.classify(_make_small_photo())
 
     assert result == ClassificationResult(is_playground=False, confidence=0.1)
@@ -99,34 +98,38 @@ def test_negative_tool_use_response_parses_into_classification_result(
 def test_request_uses_forced_tool_choice_and_matching_tool_definition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response(True, 0.7)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response(True, 0.7))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     classifier.classify(_make_small_photo())
 
-    _, kwargs = fake_client.messages.create.call_args
+    _, kwargs = fake_completion.call_args
     assert kwargs["model"] == MODEL
-    assert kwargs["tool_choice"] == {"type": "tool", "name": "classify_playground"}
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "classify_playground"},
+    }
 
     assert len(kwargs["tools"]) == 1
     tool = kwargs["tools"][0]
-    assert tool["name"] == "classify_playground"
-    assert tool["strict"] is True
-    schema = tool["input_schema"]
+    assert tool["type"] == "function"
+    function = tool["function"]
+    assert function["name"] == "classify_playground"
+    assert function["strict"] is True
+    schema = function["parameters"]
     assert schema["required"] == ["is_playground", "confidence"]
     assert set(schema["properties"]) == {"is_playground", "confidence"}
     assert schema["properties"]["is_playground"]["type"] == "boolean"
     assert schema["properties"]["confidence"]["type"] == "number"
 
     image_block = kwargs["messages"][0]["content"][0]
-    assert image_block["type"] == "image"
-    assert image_block["source"]["type"] == "base64"
-    # No resize needed for this small photo -- media_type/data reflect the
-    # original bytes untouched.
-    assert image_block["source"]["media_type"] == "image/jpeg"
-    assert base64.standard_b64decode(image_block["source"]["data"])
+    assert image_block["type"] == "image_url"
+    url = image_block["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,")
+    # No resize needed for this small photo -- the data URI's payload
+    # reflects the original bytes untouched.
+    assert base64.standard_b64decode(url.split(",", 1)[1])
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +140,10 @@ def test_request_uses_forced_tool_choice_and_matching_tool_definition(
 def test_oversized_image_is_resized_before_api_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response(True, 0.8)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response(True, 0.8))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     photo = _make_oversized_photo()
     assert Image.open(io.BytesIO(photo.bytes)).size == (9000, 100)
 
@@ -149,19 +151,22 @@ def test_oversized_image_is_resized_before_api_call(
 
     assert result == ClassificationResult(is_playground=True, confidence=0.8)
 
-    _, kwargs = fake_client.messages.create.call_args
+    _, kwargs = fake_completion.call_args
     image_block = kwargs["messages"][0]["content"][0]
-    # Resizing re-encodes as JPEG, so media_type must reflect that -- it must
-    # never claim "image/png" while shipping JPEG bytes.
-    assert image_block["source"]["media_type"] == "image/jpeg"
+    url = image_block["image_url"]["url"]
+    # Resizing re-encodes as JPEG, so the data URI's declared type must
+    # reflect that -- it must never claim "image/png" while shipping JPEG
+    # bytes.
+    assert url.startswith("data:image/jpeg;base64,")
 
-    sent_bytes = base64.standard_b64decode(image_block["source"]["data"])
+    encoded = url.split(",", 1)[1]
+    sent_bytes = base64.standard_b64decode(encoded)
     with Image.open(io.BytesIO(sent_bytes)) as resized:
         assert resized.format == "JPEG"
         width, height = resized.size
     assert width <= 8000
     assert height <= 8000
-    assert len(image_block["source"]["data"].encode("ascii")) <= 10 * 1024 * 1024
+    assert len(encoded.encode("ascii")) <= 10 * 1024 * 1024
 
 
 def test_resize_helper_is_a_noop_for_a_small_in_limits_image() -> None:
@@ -182,13 +187,12 @@ def test_resize_helper_is_a_noop_for_a_small_in_limits_image() -> None:
 
 
 def test_api_exception_raises_classifier_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.side_effect = anthropic.APIConnectionError(
-        request=MagicMock()
-    )
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(side_effect=litellm.exceptions.APIConnectionError(
+        message="boom", llm_provider="anthropic", model=MODEL
+    ))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -196,12 +200,10 @@ def test_api_exception_raises_classifier_error(monkeypatch: pytest.MonkeyPatch) 
 def test_response_with_no_tool_use_block_raises_classifier_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    text_block = SimpleNamespace(type="text", text="I can't help with that.")
-    fake_client.messages.create.return_value = SimpleNamespace(content=[text_block])
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_no_tool_call_response())
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -209,14 +211,15 @@ def test_response_with_no_tool_use_block_raises_classifier_error(
 def test_tool_use_missing_confidence_raises_classifier_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    tool_use_block = SimpleNamespace(
-        type="tool_use", input={"is_playground": True}  # confidence missing
+    function = SimpleNamespace(
+        name="classify_playground", arguments=json.dumps({"is_playground": True})
     )
-    fake_client.messages.create.return_value = SimpleNamespace(content=[tool_use_block])
-    _patch_client(monkeypatch, fake_client)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=function)]))]
+    )
+    monkeypatch.setattr(litellm, "completion", MagicMock(return_value=response))
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -224,14 +227,29 @@ def test_tool_use_missing_confidence_raises_classifier_error(
 def test_tool_use_missing_is_playground_raises_classifier_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    tool_use_block = SimpleNamespace(
-        type="tool_use", input={"confidence": 0.5}  # is_playground missing
+    function = SimpleNamespace(
+        name="classify_playground", arguments=json.dumps({"confidence": 0.5})
     )
-    fake_client.messages.create.return_value = SimpleNamespace(content=[tool_use_block])
-    _patch_client(monkeypatch, fake_client)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=function)]))]
+    )
+    monkeypatch.setattr(litellm, "completion", MagicMock(return_value=response))
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
+    with pytest.raises(ClassifierError):
+        classifier.classify(_make_small_photo())
+
+
+def test_tool_use_malformed_json_arguments_raises_classifier_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function = SimpleNamespace(name="classify_playground", arguments="{not valid json")
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=function)]))]
+    )
+    monkeypatch.setattr(litellm, "completion", MagicMock(return_value=response))
+
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -239,11 +257,10 @@ def test_tool_use_missing_is_playground_raises_classifier_error(
 def test_tool_use_non_boolean_is_playground_raises_classifier_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response("yes", 0.5)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response("yes", 0.5))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -251,11 +268,10 @@ def test_tool_use_non_boolean_is_playground_raises_classifier_error(
 def test_tool_use_confidence_out_of_range_raises_classifier_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_client = MagicMock()
-    fake_client.messages.create.return_value = _tool_use_response(True, 1.5)
-    _patch_client(monkeypatch, fake_client)
+    fake_completion = MagicMock(return_value=_tool_call_response(True, 1.5))
+    monkeypatch.setattr(litellm, "completion", fake_completion)
 
-    classifier = ClaudeVisionClassifier(model=MODEL)
+    classifier = LiteLLMVisionClassifier(model=MODEL)
     with pytest.raises(ClassifierError):
         classifier.classify(_make_small_photo())
 
@@ -263,7 +279,7 @@ def test_tool_use_confidence_out_of_range_raises_classifier_error(
 # ---------------------------------------------------------------------------
 # FR-4.1: pluggable interface -- a fake classifier drives through the ABC
 # alone, and this module never does an isinstance check against the concrete
-# ClaudeVisionClassifier.
+# LiteLLMVisionClassifier.
 # ---------------------------------------------------------------------------
 
 
@@ -289,14 +305,14 @@ def test_playground_classifier_cannot_be_instantiated_directly() -> None:
         PlaygroundClassifier()  # type: ignore[abstract]
 
 
-def test_module_never_checks_isinstance_against_claude_vision_classifier() -> None:
+def test_module_never_checks_isinstance_against_litellm_vision_classifier() -> None:
     """Design constraint (spec FR-4.1): decision_engine/cli must be able to
     drive any PlaygroundClassifier purely through the ABC, so this module
-    itself must not special-case the concrete ClaudeVisionClassifier."""
+    itself must not special-case the concrete LiteLLMVisionClassifier."""
     source = inspect.getsource(photo_classifier)
     offending_lines = [
         line
         for line in source.splitlines()
-        if "isinstance" in line and "ClaudeVisionClassifier" in line
+        if "isinstance" in line and "LiteLLMVisionClassifier" in line
     ]
     assert offending_lines == []

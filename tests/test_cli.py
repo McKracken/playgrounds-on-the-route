@@ -42,6 +42,7 @@ def test_help_exits_0_and_lists_every_flag() -> None:
 
 
 def test_omitting_vision_model_exits_2_before_any_pipeline_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(cli._VISION_MODEL_ENV_VAR, raising=False)
     fake_resolve = MagicMock()
     monkeypatch.setattr(cli.input_resolver, "resolve", fake_resolve)
 
@@ -52,6 +53,52 @@ def test_omitting_vision_model_exits_2_before_any_pipeline_stage(monkeypatch: py
     fake_resolve.assert_not_called()
 
 
+def test_vision_model_env_var_used_when_flag_omitted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(cli._VISION_MODEL_ENV_VAR, "anthropic/claude-from-env")
+    monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
+    monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=True))
+    monkeypatch.setattr(cli.storage, "save_evidence", MagicMock(return_value=[]))
+
+    exit_code = cli.main(["some input"])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] is None
+
+
+def test_vision_model_flag_overrides_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(cli._VISION_MODEL_ENV_VAR, "anthropic/claude-from-env")
+    parser = cli._build_parser()
+    args = parser.parse_args(["some input", "--vision-model", "anthropic/claude-from-flag"])
+    assert args.vision_model == "anthropic/claude-from-flag"
+
+
+def test_load_dotenv_called_before_argument_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AR-7.3: .env is loaded before the parser is built, so a
+    PLAYGROUND_CHECK_VISION_MODEL or provider credential set only in .env is
+    already visible to argparse's defaults and later credential checks."""
+    monkeypatch.setenv(cli._VISION_MODEL_ENV_VAR, "anthropic/claude-from-env")
+    call_order: list[str] = []
+    monkeypatch.setattr(cli, "load_dotenv", lambda: call_order.append("load_dotenv"))
+
+    real_build_parser = cli._build_parser
+
+    def _recording_build_parser():
+        call_order.append("build_parser")
+        return real_build_parser()
+
+    monkeypatch.setattr(cli, "_build_parser", _recording_build_parser)
+    monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
+    monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=True))
+    monkeypatch.setattr(cli.storage, "save_evidence", MagicMock(return_value=[]))
+
+    cli.main(["some input"])
+
+    assert call_order == ["load_dotenv", "build_parser"]
+
+
 def test_osm_positive_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     fake_gmaps_fetch = MagicMock()
     fake_classifier_cls = MagicMock()
@@ -60,7 +107,7 @@ def test_osm_positive_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pytest
     monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
     monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=True))
     monkeypatch.setattr(cli.gmaps_scraper, "fetch_photos", fake_gmaps_fetch)
-    monkeypatch.setattr(cli, "ClaudeVisionClassifier", fake_classifier_cls)
+    monkeypatch.setattr(cli, "LiteLLMVisionClassifier", fake_classifier_cls)
     monkeypatch.setattr(cli.storage, "save_evidence", fake_save_evidence)
 
     exit_code = cli.main(["some input", "--vision-model", "claude-fake"])
@@ -90,11 +137,13 @@ def test_gmaps_fallback_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pyte
     )
     fake_decide_from_photos = MagicMock(return_value=decision)
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(
+        cli.litellm, "validate_environment", MagicMock(return_value={"keys_in_environment": True, "missing_keys": []})
+    )
     monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
     monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=False))
     monkeypatch.setattr(cli.gmaps_scraper, "fetch_photos", MagicMock(return_value=["photo-1", "photo-2"]))
-    monkeypatch.setattr(cli, "ClaudeVisionClassifier", MagicMock())
+    monkeypatch.setattr(cli, "LiteLLMVisionClassifier", MagicMock())
     monkeypatch.setattr(cli.decision_engine, "decide_from_photos", fake_decide_from_photos)
     monkeypatch.setattr(cli.storage, "save_evidence", MagicMock(return_value=["output/some-park-x/photo-000.jpg"]))
 
@@ -115,12 +164,16 @@ def test_gmaps_fallback_end_to_end(monkeypatch: pytest.MonkeyPatch, capsys: pyte
     }
 
 
-def test_missing_api_key_returns_config_error_without_scraping(
+def test_missing_credential_returns_config_error_without_scraping(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake_gmaps_fetch = MagicMock()
 
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        cli.litellm,
+        "validate_environment",
+        MagicMock(return_value={"keys_in_environment": False, "missing_keys": ["ANTHROPIC_API_KEY"]}),
+    )
     monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
     monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=False))
     monkeypatch.setattr(cli.gmaps_scraper, "fetch_photos", fake_gmaps_fetch)
@@ -132,6 +185,7 @@ def test_missing_api_key_returns_config_error_without_scraping(
 
     output = json.loads(capsys.readouterr().out)
     assert output["error"]["code"] == "CONFIG_ERROR"
+    assert "ANTHROPIC_API_KEY" in output["error"]["message"]
     assert output["resolved"] is not None  # resolution succeeded before this check
     assert output["label"] is None
 
@@ -157,7 +211,9 @@ def test_invalid_input_returns_error_with_null_resolved(
 def test_no_photos_available_error_preserves_resolved(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(
+        cli.litellm, "validate_environment", MagicMock(return_value={"keys_in_environment": True, "missing_keys": []})
+    )
     monkeypatch.setattr(cli.input_resolver, "resolve", MagicMock(return_value=_POI))
     monkeypatch.setattr(cli.osm_lookup, "check_nearby", MagicMock(return_value=False))
     monkeypatch.setattr(
