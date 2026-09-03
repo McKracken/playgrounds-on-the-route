@@ -1,0 +1,31 @@
+[project]
+name = "playground-check"
+version = "0.1.0"
+description = "Classify a Google Maps POI as having a nearby kid's playground"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "httpx>=0.27,<1.0",
+    "playwright>=1.45,<2.0",
+    "anthropic>=0.34,<1.0",
+    "pillow>=10.4,<11.0",
+]
+
+[tool.poetry]
+packages = [{ include = "playground_check", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+
+[tool.poetry.scripts]
+playground-check = "playground_check.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that hit real external services (Overpass API, Google Maps); excluded by default",
+]
+addopts = "-m 'not integration'"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
