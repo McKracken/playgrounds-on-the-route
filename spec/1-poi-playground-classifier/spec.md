@@ -1,5 +1,9 @@
 # Spec 1: POI Playground Classifier (CLI)
 
+> **Status: CLOSED** — Implemented and verified on 2026-09-03.
+> Implementation summary: `spec/1-poi-playground-classifier/implementation-summary.md`
+> Merged from worktree branch `spec/1-poi-playground-classifier` on 2026-09-03.
+
 ## Overview
 A Python CLI that takes a single Google Maps Point of Interest (POI) — given as a Maps URL, short link, coordinates, or free-text name — and classifies it as `"playground nearby"` or `"no playground nearby"`. It first checks OpenStreetMap for a tagged playground within a short radius as a free, fast early-exit; if that's inconclusive, it falls back to opening the POI in Google Maps via a headless browser, pulling photos, and classifying them with Claude vision until enough positive photos are found or photos run out.
 
